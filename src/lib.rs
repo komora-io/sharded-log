@@ -1,3 +1,11 @@
+//! Shards batches of writes across multiple log files
+//! for high throughput and low contention. The general
+//! usage pattern is:
+//!
+//! 1. recover, pass recovered data to downstream storage
+//! 2. delete old logs
+//! 3. begin writing to the sharded logs
+
 /// Facilitates fault injection. Every time any IO operation
 /// is performed, this is decremented. If it hits 0, an
 /// io::Error is returned from that IO operation. Use this
@@ -15,6 +23,15 @@ fn rng_sleep() {
     for _ in 0..rdtsc.trailing_zeros() {
         std::thread::yield_now();
     }
+}
+
+macro_rules! weak_try {
+    ($e:expr) => {{
+        match $e {
+            Ok(ok) => ok,
+            _ => return,
+        }
+    }};
 }
 
 macro_rules! io_try {
@@ -58,10 +75,11 @@ const SUBDIR: &str = "sharded_logs";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 
 use std::{
-    collections::HashSet,
-    fs::{File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Write},
-    path::{Path, PathBuf},
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, BufWriter, Seek, Write},
+    mem::MaybeUninit,
+    path::PathBuf,
     sync::{
         atomic::{
             AtomicBool, AtomicU64, AtomicUsize, Ordering,
@@ -71,8 +89,9 @@ use std::{
 };
 
 use crc32fast::Hasher;
+use fs2::FileExt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     path: PathBuf,
     shards: u8,
@@ -89,6 +108,40 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    pub fn recover(&self) -> io::Result<RecoveryIterator> {
+        io_try!(fs::create_dir_all(self.path.join(SUBDIR)));
+
+        let _ =
+            File::create(self.path.join(SUBDIR).join(WARN));
+
+        let mut file_opts = OpenOptions::new();
+        file_opts.create(true).read(true).write(true);
+
+        let mut readers = vec![];
+
+        for idx in 0..self.shards {
+            let path = self
+                .path
+                .join(SUBDIR)
+                .join(idx.to_string());
+
+            let file = io_try!(file_opts.open(path));
+            io_try!(file.try_lock_exclusive());
+            readers.push(BufReader::new(file));
+        }
+
+        Ok(RecoveryIterator {
+            done: false,
+            config: self.clone(),
+            next_expected_lsn: 0,
+            readers,
+            last_shard: None,
+            read_buffer: BTreeMap::new(),
+        })
+    }
+}
+
 /// Allows batches of bytes to be written
 /// with low contention, and read-back
 /// in a linearized order.
@@ -97,6 +150,7 @@ pub struct ShardedLog {
     idx: usize,
     idx_counter: Arc<AtomicUsize>,
     next_lsn: Arc<AtomicU64>,
+    config: Config,
 }
 
 pub struct Reservation<'a> {
@@ -154,6 +208,7 @@ impl Clone for ShardedLog {
                 .idx_counter
                 .fetch_add(1, Ordering::SeqCst),
             next_lsn: self.next_lsn.clone(),
+            config: self.config.clone(),
         }
     }
 }
@@ -163,54 +218,134 @@ struct Shard {
     dirty: AtomicBool,
 }
 
-pub struct Iter<'a> {
+pub struct RecoveryIterator {
     next_expected_lsn: u64,
-    shards: Vec<BufReader<MutexGuard<'a, File>>>,
+    readers: Vec<BufReader<File>>,
+    read_buffer:
+        BTreeMap<u64, io::Result<(usize, Vec<Vec<u8>>)>>,
+    last_shard: Option<usize>,
+    done: bool,
+    config: Config,
 }
 
-impl<'a> Iterator for Iter<'a> {
-    type Item = io::Result<(u64, Vec<u8>)>;
+impl Iterator for RecoveryIterator {
+    type Item = io::Result<(u64, Vec<Vec<u8>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        let ret = self.next_inner();
+        if ret.is_none() {
+            self.done = true;
+        }
+        ret
     }
 }
 
-impl ShardedLog {
-    pub fn open<P: AsRef<Path>>(
-        path: P,
-    ) -> io::Result<ShardedLog> {
-        ShardedLog::open_with_config(Config {
-            path: path.as_ref().into(),
-            ..Default::default()
-        })
+impl RecoveryIterator {
+    fn next_inner(
+        &mut self,
+    ) -> Option<io::Result<(u64, Vec<Vec<u8>>)>> {
+        if let Some(last_idx) = self.last_shard {
+            self.tick(last_idx);
+        }
+
+        let lsn = self.next_expected_lsn;
+        let next_res = self
+            .read_buffer
+            .remove(&self.next_expected_lsn)?;
+
+        match next_res {
+            Ok((idx, buf)) => {
+                self.next_expected_lsn += 1;
+                self.last_shard = Some(idx);
+                Some(Ok((lsn, buf)))
+            }
+            Err(e) => Some(Err(e)),
+        }
     }
 
-    pub fn open_with_config(
-        config: Config,
+    fn tick(&mut self, idx: usize) {
+        let mut reader = &mut self.readers[idx];
+
+        let size_bytes: [u8; 8] =
+            weak_try!(read_array(&mut reader));
+        let lsn_bytes: [u8; 8] =
+            weak_try!(read_array(&mut reader));
+        let crc_expected: [u8; 4] =
+            weak_try!(read_array(&mut reader));
+
+        let mut hasher = Hasher::new();
+        hasher.update(&size_bytes);
+        hasher.update(&lsn_bytes);
+        let crc_actual = hasher.finalize().to_le_bytes();
+
+        if crc_actual != crc_expected {
+            return;
+        }
+
+        let size =
+            usize::try_from(u64::from_le_bytes(size_bytes))
+                .unwrap();
+        let lsn = u64::from_le_bytes(lsn_bytes);
+
+        let mut write_batch = vec![];
+        for _ in 0..size {
+            let crc_expected: [u8; 4] =
+                weak_try!(read_array(&mut reader));
+            let len_bytes: [u8; 8] =
+                weak_try!(read_array(&mut reader));
+
+            let len = usize::try_from(u64::from_le_bytes(
+                len_bytes,
+            ))
+            .unwrap();
+
+            let mut buf = Vec::with_capacity(len);
+
+            unsafe { buf.set_len(len) };
+
+            let mut hasher = Hasher::new();
+            hasher.update(&len_bytes);
+            hasher.update(&buf);
+            let crc_actual =
+                hasher.finalize().to_le_bytes();
+
+            if crc_actual != crc_expected {
+                return;
+            }
+
+            write_batch.push(buf);
+        }
+
+        self.read_buffer
+            .insert(lsn, Ok((idx, write_batch)));
+    }
+
+    /// After iterating over the RecoveryIterator and
+    /// applying the recovered logs to downstream storage,
+    /// you can delete the logs and create a new writer.
+    pub fn truncate_logs_and_start_writing(
+        self,
     ) -> io::Result<ShardedLog> {
-        use fs2::FileExt;
-
-        let _ = File::create(
-            config.path.join(SUBDIR).join(WARN),
-        );
-
-        let mut file_opts = OpenOptions::new();
-        file_opts.create(true).read(true).write(true);
+        if !self.done {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "RecoveryIterator::truncate_logs_and_start_writing \
+                called before the log has been iterated over. Please \
+                iterate over it first to recover the previous end of \
+                the log before writing new data."
+            ));
+        }
 
         let mut shards = vec![];
 
-        for idx in 0..config.shards {
-            let path = config
-                .path
-                .join(SUBDIR)
-                .join(idx.to_string());
-            let file = io_try!(file_opts.open(path));
-            io_try!(file.try_lock_exclusive());
+        for reader in self.readers {
+            let mut file = reader.into_inner();
+            file.seek(io::SeekFrom::Start(0))?;
+            file.set_len(0)?;
             shards.push(Shard {
                 file_mu: Mutex::new(
                     BufWriter::with_capacity(
-                        config.buf_writer_size,
+                        self.config.buf_writer_size,
                         file,
                     ),
                 ),
@@ -218,16 +353,26 @@ impl ShardedLog {
             })
         }
 
-        let next_lsn: u64 = todo!();
-
         Ok(ShardedLog {
             shards: shards.into(),
             idx: 0,
             idx_counter: Arc::new(AtomicUsize::new(1)),
-            next_lsn: Arc::new(next_lsn.into()),
+            next_lsn: Arc::new(0.into()),
+            config: self.config,
         })
     }
+}
 
+fn read_array<const LEN: usize>(
+    mut reader: impl io::Read,
+) -> io::Result<[u8; LEN]> {
+    let mut buf: [u8; LEN] =
+        unsafe { MaybeUninit::uninit().assume_init() };
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+impl ShardedLog {
     /// Write a batch of buffers to the sharded log.
     /// Returns the logical sequence number that they
     /// will be recoverable at after your next call
@@ -237,7 +382,7 @@ impl ShardedLog {
     /// possible that the log is in a
     /// TODO
     pub fn write_batch<B: AsRef<[u8]>>(
-        &mut self,
+        &self,
         write_batch: &[B],
     ) -> io::Result<u64> {
         self.reservation().write_batch(write_batch)
@@ -249,7 +394,7 @@ impl ShardedLog {
     /// `Reservation::abort`. This is particularly
     /// useful for logging fallible lock-free operations
     /// to disk in an order-preserving manner.
-    pub fn reservation(&mut self) -> Reservation<'_> {
+    pub fn reservation(&self) -> Reservation<'_> {
         let shard = self.get_shard();
 
         // NB lsn has to be created after acquiring the shard.
@@ -261,17 +406,6 @@ impl ShardedLog {
             lsn,
             completed: false,
         }
-    }
-
-    /// Read the entire log off of disk, zipping all shards
-    /// together to iterate over non-aborted batches
-    pub fn iter(&self) -> Iter<'_> {
-        todo!()
-    }
-
-    ///
-    pub fn reset(&self) -> io::Result<()> {
-        todo!()
     }
 
     /// Flushes and fsyncs in-memory shard data that
@@ -310,10 +444,14 @@ impl ShardedLog {
                 return shard;
             }
         }
+        let ret =
+            self.shards[self.idx].file_mu.lock().unwrap();
+        // NB: dirty must be set after locking shard
+        // to properly synchronize with flush's unset
         self.shards[self.idx]
             .dirty
             .store(true, Ordering::Release);
-        self.shards[self.idx].file_mu.lock().unwrap()
+        ret
     }
 }
 
@@ -351,4 +489,96 @@ fn write_batch_inner<B: AsRef<[u8]>>(
     }
 
     Ok(lsn)
+}
+
+#[test]
+fn concurrency() {
+    let n_threads = 16_usize;
+    let n_ops_per_thread = 10 * 1024;
+
+    static CONCURRENCY_TEST_COUNTER: AtomicU64 =
+        AtomicU64::new(0);
+
+    let config = Config {
+        shards: (n_threads / 4).max(1) as u8,
+        path: "test_concurrency".into(),
+        ..Default::default()
+    };
+
+    let _ = std::fs::remove_dir_all(&config.path);
+
+    let mut recovery = config.recover().unwrap();
+
+    for _ in &mut recovery {}
+
+    let log = Arc::new(
+        recovery.truncate_logs_and_start_writing().unwrap(),
+    );
+
+    let barrier =
+        Arc::new(std::sync::Barrier::new(n_threads + 1));
+    let mut threads = vec![];
+    for _ in 0..n_threads {
+        let barrier = barrier.clone();
+        let log = log.clone();
+
+        let thread = std::thread::spawn(move || {
+            barrier.wait();
+
+            let mut successes = 0;
+            while successes < n_ops_per_thread {
+                let old_value = CONCURRENCY_TEST_COUNTER
+                    .load(Ordering::Acquire);
+
+                rng_sleep();
+
+                let reservation = log.reservation();
+
+                rng_sleep();
+
+                let cas_res = CONCURRENCY_TEST_COUNTER
+                    .compare_exchange(
+                        old_value,
+                        old_value + 1,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+
+                if cas_res.is_ok() {
+                    let value =
+                        (old_value + 1).to_le_bytes();
+                    reservation
+                        .write_batch(&[value])
+                        .unwrap();
+                    successes += 1;
+                } else {
+                    reservation.abort().unwrap();
+                }
+            }
+        });
+
+        threads.push(thread);
+    }
+
+    barrier.wait();
+
+    for thread in threads.into_iter() {
+        thread.join().unwrap();
+    }
+
+    drop(log);
+
+    let mut iter = config.recover().unwrap();
+
+    for expected in 0..n_threads * n_ops_per_thread {
+        let next =
+            iter.next().unwrap().unwrap().1.pop().unwrap();
+        let value =
+            u64::from_le_bytes(next.try_into().unwrap());
+        assert_eq!(value, expected as u64);
+    }
+
+    drop(iter);
+
+    let _ = std::fs::remove_dir_all(&config.path);
 }
