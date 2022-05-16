@@ -303,8 +303,8 @@ impl RecoveryIterator {
 
         for reader in self.readers {
             let mut file = reader.into_inner();
-            file.seek(io::SeekFrom::Start(0))?;
-            file.set_len(0)?;
+            fallible!(file.seek(io::SeekFrom::Start(0)));
+            fallible!(file.set_len(0));
             shards.push(Shard {
                 file_mu: Mutex::new(
                     BufWriter::with_capacity(
@@ -382,8 +382,8 @@ impl ShardedLog {
                 let mut file =
                     shard.file_mu.lock().unwrap();
                 if shard.dirty.load(Ordering::Acquire) {
-                    file.flush()?;
-                    file.get_mut().sync_all()?;
+                    fallible!(file.flush());
+                    fallible!(file.get_mut().sync_all());
                     shard
                         .dirty
                         .store(false, Ordering::Release);
