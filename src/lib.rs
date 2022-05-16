@@ -410,7 +410,7 @@ impl ShardedLog {
     }
 
     /// Delete all logs in the system
-    pub fn purge_logs(&self) -> io::Result<()> {
+    pub fn purge(&self) -> io::Result<()> {
         let mut buffers = vec![];
         for shard in &*self.shards {
             let buffer = shard.file_mu.lock().unwrap();
