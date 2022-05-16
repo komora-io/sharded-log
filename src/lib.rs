@@ -377,7 +377,7 @@ impl ShardedLog {
     /// of `ShardedLog`, but skipping shards that have
     /// been written to by others. To flush all shards,
     /// use `flush_all`.
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&self) -> io::Result<()> {
         for shard in &*self.shards {
             if shard.dirty.load(Ordering::Acquire) {
                 let mut file =
