@@ -21,7 +21,7 @@ const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Seek, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     mem::MaybeUninit,
     path::PathBuf,
     sync::{
@@ -33,14 +33,18 @@ use std::{
 };
 
 use crc32fast::Hasher;
-use fault_injection::fallible;
+use fault_injection::{fallible, maybe};
 use fs2::FileExt;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    path: PathBuf,
-    shards: u8,
-    buf_writer_size: usize,
+    /// Where to open the log.
+    pub path: PathBuf,
+    /// Number of sharded log files. Future calls to `recover` must always use at least this
+    /// many shards, otherwise the system will not be able to recover. Defaults to 8.
+    pub shards: u8,
+    /// The in-memory buffer size in front of each log file. Defaults to 512k.
+    pub in_memory_buffer_per_log: usize,
 }
 
 impl Default for Config {
@@ -48,7 +52,7 @@ impl Default for Config {
         Config {
             path: Default::default(),
             shards: 8,
-            buf_writer_size: 512 * 1024,
+            in_memory_buffer_per_log: 512 * 1024,
         }
     }
 }
@@ -78,14 +82,20 @@ impl Config {
             readers.push(BufReader::new(file));
         }
 
-        Ok(RecoveryIterator {
+        let mut ret = RecoveryIterator {
             done: false,
             config: self.clone(),
             next_expected_lsn: 0,
             readers,
             last_shard: None,
             read_buffer: BTreeMap::new(),
-        })
+        };
+
+        for idx in 0..self.shards {
+            ret.tick(idx as usize);
+        }
+
+        Ok(ret)
     }
 }
 
@@ -130,6 +140,7 @@ impl<'a> Reservation<'a> {
         mut self,
         write_batch: &[B],
     ) -> io::Result<u64> {
+        self.completed = true;
         write_batch_inner(
             &mut self.shard,
             self.lsn,
@@ -138,6 +149,7 @@ impl<'a> Reservation<'a> {
     }
 
     pub fn abort(mut self) -> io::Result<u64> {
+        self.completed = true;
         write_batch_inner::<&[u8]>(
             &mut self.shard,
             self.lsn,
@@ -213,19 +225,21 @@ impl RecoveryIterator {
     fn tick(&mut self, idx: usize) {
         let mut reader = &mut self.readers[idx];
 
+        let crc_expected: [u8; 4] =
+            weak_try!(read_array(&mut reader));
         let size_bytes: [u8; 8] =
             weak_try!(read_array(&mut reader));
         let lsn_bytes: [u8; 8] =
-            weak_try!(read_array(&mut reader));
-        let crc_expected: [u8; 4] =
             weak_try!(read_array(&mut reader));
 
         let mut hasher = Hasher::new();
         hasher.update(&size_bytes);
         hasher.update(&lsn_bytes);
-        let crc_actual = hasher.finalize().to_le_bytes();
+        let crc_actual =
+            (hasher.finalize() ^ 0xFF).to_le_bytes();
 
         if crc_actual != crc_expected {
+            eprintln!("encountered corrupted crc in log");
             return;
         }
 
@@ -250,11 +264,13 @@ impl RecoveryIterator {
 
             unsafe { buf.set_len(len) };
 
+            weak_try!(maybe!(reader.read_exact(&mut buf)));
+
             let mut hasher = Hasher::new();
             hasher.update(&len_bytes);
             hasher.update(&buf);
             let crc_actual =
-                hasher.finalize().to_le_bytes();
+                (hasher.finalize() ^ 0xFF).to_le_bytes();
 
             if crc_actual != crc_expected {
                 return;
@@ -292,7 +308,8 @@ impl RecoveryIterator {
             shards.push(Shard {
                 file_mu: Mutex::new(
                     BufWriter::with_capacity(
-                        self.config.buf_writer_size,
+                        self.config
+                            .in_memory_buffer_per_log,
                         file,
                     ),
                 ),
@@ -413,7 +430,8 @@ fn write_batch_inner<B: AsRef<[u8]>>(
     let mut hasher = Hasher::new();
     hasher.update(&size_bytes);
     hasher.update(&lsn_bytes);
-    let crc: [u8; 4] = hasher.finalize().to_le_bytes();
+    let crc: [u8; 4] =
+        (hasher.finalize() ^ 0xFF).to_le_bytes();
 
     fallible!(shard.write_all(&crc));
     fallible!(shard.write_all(&size_bytes));
@@ -428,7 +446,8 @@ fn write_batch_inner<B: AsRef<[u8]>>(
         let mut hasher = Hasher::new();
         hasher.update(&len_bytes);
         hasher.update(&buf);
-        crc_bytes = hasher.finalize().to_le_bytes();
+        crc_bytes =
+            (hasher.finalize() ^ 0xFF).to_le_bytes();
 
         fallible!(shard.write_all(&crc_bytes));
         fallible!(shard.write_all(&len_bytes));
@@ -477,11 +496,7 @@ fn concurrency() {
                 let old_value = CONCURRENCY_TEST_COUNTER
                     .load(Ordering::Acquire);
 
-                rng_sleep();
-
                 let reservation = log.reservation();
-
-                rng_sleep();
 
                 let cas_res = CONCURRENCY_TEST_COUNTER
                     .compare_exchange(
@@ -492,8 +507,7 @@ fn concurrency() {
                     );
 
                 if cas_res.is_ok() {
-                    let value =
-                        (old_value + 1).to_le_bytes();
+                    let value = old_value.to_le_bytes();
                     reservation
                         .write_batch(&[value])
                         .unwrap();
@@ -517,12 +531,17 @@ fn concurrency() {
 
     let mut iter = config.recover().unwrap();
 
-    for expected in 0..n_threads * n_ops_per_thread {
-        let next =
-            iter.next().unwrap().unwrap().1.pop().unwrap();
-        let value =
-            u64::from_le_bytes(next.try_into().unwrap());
-        assert_eq!(value, expected as u64);
+    let mut successes = 0;
+    while successes < n_threads * n_ops_per_thread {
+        if let Some(next) =
+            iter.next().unwrap().unwrap().1.pop()
+        {
+            let value = u64::from_le_bytes(
+                next.try_into().unwrap(),
+            );
+            assert_eq!(value, successes as u64);
+            successes += 1;
+        }
     }
 
     drop(iter);
