@@ -1,9 +1,15 @@
 [package]
 name = "sharded-log"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["Tyler Neely <tylerneely@gmail.com>"]
+description = "A sharded log for multi-threaded logging"
+license = "GPL-3.0"
+repository = "https://github.com/komora-io/sharded-log"
+documentation = "https://docs.rs/sharded-log/"
+keywords = ["logging", "multi-threaded", "performance", "database", "transaction"]
+categories = ["development-tools", "concurrency", "filesystem", "database-implementations"]
+readme = "README.md"
 
 [dependencies]
 crc32fast = "1.3.2"

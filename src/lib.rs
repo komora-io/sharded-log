@@ -49,16 +49,19 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Iterate over all log shards, returning batches in the
+    /// order that they were written in, even if they landed
+    /// in different shards. This method does not take out an
+    /// exclusive file lock on the shards in the way that
+    /// `Config::purge` and `Config::create` do, so it can
+    /// be used on logs that are actively being written.
+    /// HOWEVER: keep in mind that while writing logs,
+    /// significant data may remain in the in-memory
+    /// `BufWriter` instances until you call
+    /// `ShardedLog::flush`!
     pub fn recover(&self) -> io::Result<RecoveryIterator> {
-        fallible!(fs::create_dir_all(
-            self.path.join(SUBDIR)
-        ));
-
-        let _ =
-            File::create(self.path.join(SUBDIR).join(WARN));
-
         let mut file_opts = OpenOptions::new();
-        file_opts.create(true).read(true).write(true);
+        file_opts.read(true);
 
         let mut readers = vec![];
 
@@ -69,13 +72,11 @@ impl Config {
                 .join(idx.to_string());
 
             let file = fallible!(file_opts.open(path));
-            fallible!(file.try_lock_exclusive());
             readers.push(BufReader::new(file));
         }
 
         let mut ret = RecoveryIterator {
             done: false,
-            config: self.clone(),
             next_expected_lsn: 0,
             readers,
             last_shard: None,
@@ -88,6 +89,73 @@ impl Config {
 
         Ok(ret)
     }
+
+    fn lock(&self) -> io::Result<File> {
+        fallible!(fs::create_dir_all(
+            self.path.join(SUBDIR)
+        ));
+        let mut lock_options = OpenOptions::new();
+        lock_options.read(true).create(true).write(true);
+        let lock_file = fallible!(lock_options
+            .open(self.path.join(SUBDIR).join(WARN)));
+        fallible!(lock_file.try_lock_exclusive());
+        Ok(lock_file)
+    }
+
+    /// Clear the previous contents of a log directory.
+    /// Requires an exclusive lock over the log directory,
+    /// and may not be performed concurrently with an
+    /// active `ShardedLog`.
+    pub fn purge(&self) -> io::Result<()> {
+        let _lock_file = Arc::new(fallible!(self.lock()));
+        fs::remove_dir_all(&self.path)
+    }
+
+    /// Exclusively create a new log directory that
+    /// may be used for writing sharded logs to.
+    pub fn create(&self) -> io::Result<ShardedLog> {
+        fallible!(fs::create_dir_all(
+            self.path.join(SUBDIR)
+        ));
+
+        let lock_file = Arc::new(fallible!(self.lock()));
+
+        let mut file_opts = OpenOptions::new();
+        file_opts.create_new(true).write(true);
+
+        let mut shards = vec![];
+        for idx in 0..self.shards {
+            let path = self
+                .path
+                .join(SUBDIR)
+                .join(idx.to_string());
+
+            let file = fallible!(file_opts.open(path));
+
+            shards.push(Shard {
+                file_mu: Mutex::new(
+                    BufWriter::with_capacity(
+                        self.in_memory_buffer_per_log,
+                        file,
+                    ),
+                ),
+                dirty: false.into(),
+            })
+        }
+
+        fallible!(
+            File::open(self.path.join(SUBDIR))?.sync_all()
+        );
+
+        Ok(ShardedLog {
+            shards: shards.into(),
+            idx: 0,
+            idx_counter: Arc::new(AtomicUsize::new(1)),
+            next_lsn: Arc::new(0.into()),
+            config: self.clone(),
+            lock_file,
+        })
+    }
 }
 
 /// Allows batches of bytes to be written
@@ -99,6 +167,7 @@ pub struct ShardedLog {
     idx_counter: Arc<AtomicUsize>,
     next_lsn: Arc<AtomicU64>,
     config: Config,
+    lock_file: Arc<File>,
 }
 
 pub struct Reservation<'a> {
@@ -159,6 +228,7 @@ impl Clone for ShardedLog {
                 .fetch_add(1, Ordering::SeqCst),
             next_lsn: self.next_lsn.clone(),
             config: self.config.clone(),
+            lock_file: self.lock_file.clone(),
         }
     }
 }
@@ -171,15 +241,13 @@ struct Shard {
 pub struct RecoveryIterator {
     next_expected_lsn: u64,
     readers: Vec<BufReader<File>>,
-    read_buffer:
-        BTreeMap<u64, io::Result<(usize, Vec<Vec<u8>>)>>,
+    read_buffer: BTreeMap<u64, (usize, Vec<Vec<u8>>)>,
     last_shard: Option<usize>,
     done: bool,
-    config: Config,
 }
 
 impl Iterator for RecoveryIterator {
-    type Item = io::Result<(u64, Vec<Vec<u8>>)>;
+    type Item = Vec<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let ret = self.next_inner();
@@ -191,26 +259,18 @@ impl Iterator for RecoveryIterator {
 }
 
 impl RecoveryIterator {
-    fn next_inner(
-        &mut self,
-    ) -> Option<io::Result<(u64, Vec<Vec<u8>>)>> {
+    fn next_inner(&mut self) -> Option<Vec<Vec<u8>>> {
         if let Some(last_idx) = self.last_shard {
             self.tick(last_idx);
         }
 
-        let lsn = self.next_expected_lsn;
-        let next_res = self
+        let (idx, buf) = self
             .read_buffer
             .remove(&self.next_expected_lsn)?;
 
-        match next_res {
-            Ok((idx, buf)) => {
-                self.next_expected_lsn += 1;
-                self.last_shard = Some(idx);
-                Some(Ok((lsn, buf)))
-            }
-            Err(e) => Some(Err(e)),
-        }
+        self.next_expected_lsn += 1;
+        self.last_shard = Some(idx);
+        Some(buf)
     }
 
     fn tick(&mut self, idx: usize) {
@@ -279,51 +339,7 @@ impl RecoveryIterator {
             write_batch.push(buf);
         }
 
-        self.read_buffer
-            .insert(lsn, Ok((idx, write_batch)));
-    }
-
-    /// After iterating over the RecoveryIterator and
-    /// applying the recovered logs to downstream storage,
-    /// you can delete the logs and create a new writer.
-    pub fn truncate_logs_and_start_writing(
-        self,
-    ) -> io::Result<ShardedLog> {
-        if !self.done {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "RecoveryIterator::truncate_logs_and_start_writing \
-                called before the log has been iterated over. Please \
-                iterate over it first to recover the previous end of \
-                the log before writing new data."
-            ));
-        }
-
-        let mut shards = vec![];
-
-        for reader in self.readers {
-            let mut file = reader.into_inner();
-            fallible!(file.seek(io::SeekFrom::Start(0)));
-            fallible!(file.set_len(0));
-            shards.push(Shard {
-                file_mu: Mutex::new(
-                    BufWriter::with_capacity(
-                        self.config
-                            .in_memory_buffer_per_log,
-                        file,
-                    ),
-                ),
-                dirty: false.into(),
-            })
-        }
-
-        Ok(ShardedLog {
-            shards: shards.into(),
-            idx: 0,
-            idx_counter: Arc::new(AtomicUsize::new(1)),
-            next_lsn: Arc::new(0.into()),
-            config: self.config,
-        })
+        self.read_buffer.insert(lsn, (idx, write_batch));
     }
 }
 
@@ -393,8 +409,7 @@ impl ShardedLog {
         Ok(())
     }
 
-    /// Delete all logs in the system after applying them
-    /// to downstream storage.
+    /// Delete all logs in the system
     pub fn purge_logs(&self) -> io::Result<()> {
         let mut buffers = vec![];
         for shard in &*self.shards {
@@ -419,18 +434,15 @@ impl ShardedLog {
         // after all dirty flags are clear
         drop(buffers);
 
-        fallible!(File::open(
-            self.config.path.join(SUBDIR)
-        )?
-        .sync_all());
-
         Ok(())
     }
 
     fn get_shard(&self) -> MutexGuard<'_, BufWriter<File>> {
         let len = self.shards.len();
         for i in 0..len {
-            let idx = self.idx.wrapping_add(i) % len;
+            // walk backwards to avoid creating
+            // contention for the very next write
+            let idx = self.idx.wrapping_sub(i) % len;
 
             if let Ok(shard) =
                 self.shards[idx].file_mu.try_lock()
@@ -441,13 +453,16 @@ impl ShardedLog {
                 return shard;
             }
         }
+
         let ret =
             self.shards[self.idx].file_mu.lock().unwrap();
+
         // NB: dirty must be set after locking shard
         // to properly synchronize with flush's unset
         self.shards[self.idx]
             .dirty
             .store(true, Ordering::Release);
+
         ret
     }
 }
@@ -504,15 +519,9 @@ fn concurrency() {
         ..Default::default()
     };
 
-    let _ = std::fs::remove_dir_all(&config.path);
+    config.purge().unwrap();
 
-    let mut recovery = config.recover().unwrap();
-
-    for _ in &mut recovery {}
-
-    let log = Arc::new(
-        recovery.truncate_logs_and_start_writing().unwrap(),
-    );
+    let log = Arc::new(config.create().unwrap());
 
     let barrier =
         Arc::new(std::sync::Barrier::new(n_threads + 1));
@@ -570,9 +579,7 @@ fn concurrency() {
 
     let mut successes = 0;
     while successes < n_threads * n_ops_per_thread {
-        if let Some(next) =
-            iter.next().unwrap().unwrap().1.pop()
-        {
+        if let Some(next) = iter.next().unwrap().pop() {
             let value = u64::from_le_bytes(
                 next.try_into().unwrap(),
             );

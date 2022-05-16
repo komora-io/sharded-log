@@ -12,12 +12,9 @@ fn main() {
         ..Default::default()
     };
 
-    let mut recovery = config.recover().unwrap();
-    for _ in &mut recovery {}
+    config.purge().unwrap();
 
-    let log = Arc::new(
-        recovery.truncate_logs_and_start_writing().unwrap(),
-    );
+    let log = Arc::new(config.create().unwrap());
 
     let barrier =
         Arc::new(Barrier::new(number_of_threads + 1));
@@ -73,4 +70,6 @@ fn main() {
         buffers_per_batch,
         buffer_size
     );
+
+    let _ = std::fs::remove_dir_all("write_performance");
 }
