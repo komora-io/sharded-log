@@ -6,15 +6,6 @@
 //! 2. delete old logs
 //! 3. begin writing to the sharded logs
 
-macro_rules! weak_try {
-    ($e:expr) => {{
-        match $e {
-            Ok(ok) => ok,
-            _ => return,
-        }
-    }};
-}
-
 const SUBDIR: &str = "sharded_logs";
 const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 
@@ -223,6 +214,15 @@ impl RecoveryIterator {
     }
 
     fn tick(&mut self, idx: usize) {
+        macro_rules! weak_try {
+            ($e:expr) => {{
+                match $e {
+                    Ok(ok) => ok,
+                    _ => return,
+                }
+            }};
+        }
+
         let mut reader = &mut self.readers[idx];
 
         let crc_expected: [u8; 4] =
