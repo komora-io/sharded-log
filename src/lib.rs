@@ -340,11 +340,10 @@ impl ShardedLog {
     /// Write a batch of buffers to the sharded log.
     /// Returns the logical sequence number that they
     /// will be recoverable at after your next call
-    /// to `flush`.
-    ///
-    /// If this function returns an error, it is
-    /// possible that the log is in a
-    /// TODO
+    /// to `flush`. Writes the batch into a `BufWriter`
+    /// in front of the sharded log file, which will
+    /// be flushed on Drop, but can also be flushed
+    /// using the `flush` method.
     pub fn write_batch<B: AsRef<[u8]>>(
         &self,
         write_batch: &[B],
@@ -390,6 +389,22 @@ impl ShardedLog {
                         .store(false, Ordering::Release);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Delete all logs in the system after applying them
+    /// to downstream storage.
+    pub fn purge_logs(&self) -> io::Result<()> {
+        for shard in &*self.shards {
+            let mut buffer = shard.file_mu.lock().unwrap();
+            fallible!(buffer.flush());
+
+            let file = buffer.get_mut();
+            fallible!(file.seek(io::SeekFrom::Start(0)));
+            fallible!(file.set_len(0));
+
+            shard.dirty.store(false, Ordering::Release);
         }
         Ok(())
     }
