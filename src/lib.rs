@@ -496,7 +496,11 @@ fn concurrency() {
                 let old_value = CONCURRENCY_TEST_COUNTER
                     .load(Ordering::Acquire);
 
+                std::thread::yield_now();
+
                 let reservation = log.reservation();
+
+                std::thread::yield_now();
 
                 let cas_res = CONCURRENCY_TEST_COUNTER
                     .compare_exchange(
