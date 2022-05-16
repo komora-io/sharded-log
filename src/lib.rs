@@ -6,67 +6,11 @@
 //! 2. delete old logs
 //! 3. begin writing to the sharded logs
 
-/// Facilitates fault injection. Every time any IO operation
-/// is performed, this is decremented. If it hits 0, an
-/// io::Error is returned from that IO operation. Use this
-/// to ensure that error handling is being performed, by
-/// running some test workload, checking the counter, and
-/// then setting this to an incrementally-lower number while
-/// asserting that your application properly handles the
-/// error that will propagate up.
-pub static FAULT_INJECT_COUNTER: AtomicU64 =
-    AtomicU64::new(u64::MAX);
-
-fn rng_sleep() {
-    let rdtsc =
-        unsafe { core::arch::x86_64::_rdtsc() as u16 };
-    for _ in 0..rdtsc.trailing_zeros() {
-        std::thread::yield_now();
-    }
-}
-
 macro_rules! weak_try {
     ($e:expr) => {{
         match $e {
             Ok(ok) => ok,
             _ => return,
-        }
-    }};
-}
-
-macro_rules! io_try {
-    ($e:expr) => {{
-        if crate::FAULT_INJECT_COUNTER
-            .fetch_sub(1, Ordering::Relaxed)
-            == 1
-        {
-            return Err(io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "injected fault at {}:{}",
-                    file!(),
-                    line!()
-                ),
-            ));
-        }
-
-        crate::rng_sleep();
-
-        // converts io::Error to include the location of
-        // error creation
-        match $e {
-            Ok(ok) => ok,
-            Err(e) => {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "{}:{} -> {}",
-                        file!(),
-                        line!(),
-                        e.to_string()
-                    ),
-                ))
-            }
         }
     }};
 }
@@ -89,6 +33,7 @@ use std::{
 };
 
 use crc32fast::Hasher;
+use fault_injection::fallible;
 use fs2::FileExt;
 
 #[derive(Debug, Clone)]
@@ -110,7 +55,9 @@ impl Default for Config {
 
 impl Config {
     pub fn recover(&self) -> io::Result<RecoveryIterator> {
-        io_try!(fs::create_dir_all(self.path.join(SUBDIR)));
+        fallible!(fs::create_dir_all(
+            self.path.join(SUBDIR)
+        ));
 
         let _ =
             File::create(self.path.join(SUBDIR).join(WARN));
@@ -126,8 +73,8 @@ impl Config {
                 .join(SUBDIR)
                 .join(idx.to_string());
 
-            let file = io_try!(file_opts.open(path));
-            io_try!(file.try_lock_exclusive());
+            let file = fallible!(file_opts.open(path));
+            fallible!(file.try_lock_exclusive());
             readers.push(BufReader::new(file));
         }
 
@@ -468,9 +415,9 @@ fn write_batch_inner<B: AsRef<[u8]>>(
     hasher.update(&lsn_bytes);
     let crc: [u8; 4] = hasher.finalize().to_le_bytes();
 
-    io_try!(shard.write_all(&crc));
-    io_try!(shard.write_all(&size_bytes));
-    io_try!(shard.write_all(&lsn_bytes));
+    fallible!(shard.write_all(&crc));
+    fallible!(shard.write_all(&size_bytes));
+    fallible!(shard.write_all(&lsn_bytes));
 
     for buf_i in write_batch {
         let buf = buf_i.as_ref();
@@ -483,9 +430,9 @@ fn write_batch_inner<B: AsRef<[u8]>>(
         hasher.update(&buf);
         crc_bytes = hasher.finalize().to_le_bytes();
 
-        io_try!(shard.write_all(&crc_bytes));
-        io_try!(shard.write_all(&len_bytes));
-        io_try!(shard.write_all(buf));
+        fallible!(shard.write_all(&crc_bytes));
+        fallible!(shard.write_all(&len_bytes));
+        fallible!(shard.write_all(buf));
     }
 
     Ok(lsn)
