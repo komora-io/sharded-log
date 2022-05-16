@@ -396,16 +396,34 @@ impl ShardedLog {
     /// Delete all logs in the system after applying them
     /// to downstream storage.
     pub fn purge_logs(&self) -> io::Result<()> {
+        let mut buffers = vec![];
         for shard in &*self.shards {
-            let mut buffer = shard.file_mu.lock().unwrap();
+            let buffer = shard.file_mu.lock().unwrap();
+            buffers.push(buffer);
+        }
+
+        for buffer in &mut buffers {
             fallible!(buffer.flush());
 
             let file = buffer.get_mut();
             fallible!(file.seek(io::SeekFrom::Start(0)));
             fallible!(file.set_len(0));
+            fallible!(file.sync_all());
+        }
 
+        for shard in &*self.shards {
             shard.dirty.store(false, Ordering::Release);
         }
+
+        // NB: buffers holds mutexes which must be held open until
+        // after all dirty flags are clear
+        drop(buffers);
+
+        fallible!(File::open(
+            self.config.path.join(SUBDIR)
+        )?
+        .sync_all());
+
         Ok(())
     }
 
